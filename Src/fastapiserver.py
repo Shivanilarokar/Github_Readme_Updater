@@ -1,71 +1,59 @@
-# src/main.py
-from fastapi import FastAPI, Request, Header, HTTPException, Response
-import hmac, hashlib, logging, os
-from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
-import sys
+from fastapi import FastAPI, Request, Header, HTTPException
+import hmac, hashlib, logging, os, sys, traceback, json
+from github import Github  # PyGithub
+from Src.config import GITHUB_WEBHOOK_SECRET, GITHUB_TOKEN
+from Src.agents.orchestrator import run_flow
 
-# ----------------------------
-# Config from env
-# ----------------------------
-GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
-
-# ----------------------------
-# Logger setup
-# ----------------------------
-logger = logging.getLogger("ai-readme-updater")
+logger = logging.getLogger("FastAPIWebhook")
 handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# ----------------------------
-# FastAPI app
-# ----------------------------
 app = FastAPI()
+gh = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
-# ----------------------------
-# Metrics
-# ----------------------------
-WEBHOOK_COUNTER = Counter("webhook_events_total", "Total webhook events", ["event"])
 
-# ----------------------------
-# Helper functions
-# ----------------------------
+# -------------------
+# Verify GitHub Signature
+# -------------------
 def verify_signature(body: bytes, signature: str):
-    """Verify GitHub webhook signature"""
     if not GITHUB_WEBHOOK_SECRET:
         return True
     if not signature:
         raise HTTPException(status_code=400, detail="Missing signature")
-
     mac = hmac.new(GITHUB_WEBHOOK_SECRET.encode(), msg=body, digestmod=hashlib.sha256)
     expected = "sha256=" + mac.hexdigest()
     if not hmac.compare_digest(expected, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
-# ----------------------------
-# Separate Handlers
-# ----------------------------
-def handle_pr_event(owner, repo, pr_number, action):
-    logger.info("📌 Handling PR %s event for %s/%s#%s", action, owner, repo, pr_number)
-    # TODO: enqueue job or call multi-agent system here
 
-def handle_push_event(owner, repo, head_sha):
-    logger.info("📌 Handling PUSH event for %s/%s @ %s", owner, repo, head_sha)
-    # TODO: enqueue job or call multi-agent system here
+# -------------------
+# Extract diffs reliably
+# -------------------
+def extract_diffs(files):
+    diffs = {}
+    for f in files:
+        # Try the official PyGithub field first
+        patch = getattr(f, "patch", None)
 
-# ----------------------------
+        # Fallback: sometimes patch only lives in raw_data
+        if not patch:
+            raw = getattr(f, "raw_data", {})
+            patch = raw.get("patch")
+
+        diffs[f.filename] = patch or "<<NO PATCH AVAILABLE>>"
+    return diffs
+
+
+# -------------------
 # Routes
-# ----------------------------
+# -------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-@app.get("/metrics")
-async def metrics():
-    data = generate_latest()
-    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/webhook")
 async def webhook(
@@ -77,29 +65,70 @@ async def webhook(
     verify_signature(body, x_hub_signature_256)
     payload = await request.json()
 
-    # Count metric
-    WEBHOOK_COUNTER.labels(event=x_github_event or "unknown").inc()
+    try:
+        state = None
 
-    # ---------------- PR Event ----------------
-    if x_github_event == "pull_request":
-        action = payload.get("action")
-        if action in ("opened", "synchronize", "edited", "reopened"):
-            pr = payload["pull_request"]
+        if x_github_event == "pull_request":
+            action = payload.get("action")
+            if action in ("opened", "synchronize", "reopened", "edited"):
+                pr = payload["pull_request"]
+                owner = payload["repository"]["owner"]["login"]
+                repo = payload["repository"]["name"]
+                pr_number = pr["number"]
+
+                repo_obj = gh.get_repo(f"{owner}/{repo}")
+                pr_obj = repo_obj.get_pull(pr_number)
+                files = list(pr_obj.get_files())
+                diffs = extract_diffs(files)
+
+                logger.info(
+                    "📌 Handling PR %s/%s#%s (files=%d)",
+                    owner,
+                    repo,
+                    pr_number,
+                    len(diffs),
+                )
+                logger.info("📌 Incoming diffs:\n%s", json.dumps(diffs, indent=2))
+
+                state = {"owner": owner, "repo": repo, "pr_number": pr_number, "diffs": diffs}
+
+        elif x_github_event == "push":
             owner = payload["repository"]["owner"]["login"]
             repo = payload["repository"]["name"]
-            pr_number = pr["number"]
-            handle_pr_event(owner, repo, pr_number, action)
-            return {"ok": True, "type": "pull_request", "action": action, "pr_number": pr_number}
-        return {"ok": True, "note": "ignored PR action"}
+            head_sha = payload.get("after")
 
-    # ---------------- Push Event ----------------
-    if x_github_event == "push":
-        owner = payload["repository"]["owner"]["login"]
-        repo = payload["repository"]["name"]
-        head_sha = payload.get("after")
-        handle_push_event(owner, repo, head_sha)
-        return {"ok": True, "type": "push", "head_sha": head_sha}
+            repo_obj = gh.get_repo(f"{owner}/{repo}")
+            commit = repo_obj.get_commit(head_sha)
+            files = list(commit.files)
+            diffs = extract_diffs(files)
 
-    # ---------------- Other Events ----------------
-    logger.info("⚠️ Unhandled event %s", x_github_event)
-    return {"ok": True, "note": "unhandled event"}
+            logger.info(
+                "📌 Handling PUSH %s/%s @ %s (files=%d)",
+                owner,
+                repo,
+                head_sha,
+                len(diffs),
+            )
+            logger.info("📌 Incoming diffs:\n%s", json.dumps(diffs, indent=2))
+
+            state = {
+                "owner": owner,
+                "repo": repo,
+                "commit_sha": head_sha,
+                "pr_number": 0,
+                "diffs": diffs,
+            }
+
+        if state:
+            result = run_flow(state)
+            logger.info("🔥 Full LangGraph output:\n%s", json.dumps(result, indent=2))
+            return {"ok": True, "event": x_github_event, "result": result}
+
+        logger.info("⚠️ Ignored event %s", x_github_event)
+        return {"ok": True, "note": "ignored event"}
+
+    except Exception as e:
+        logger.exception("Webhook handler error: %s", e)
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+
+
