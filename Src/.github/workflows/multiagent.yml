@@ -1,0 +1,49 @@
+name: MultiAgent README Updater
+
+# Trigger on all pushes and PRs targeting default branch(s)
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    # PRs that target your default branch (main/master)
+    branches:
+      - main
+      - master
+
+jobs:
+  run-multiagent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # needed to create commits / PRs if using PAT or GITHUB_TOKEN
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # we need history/commits for compare API
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run LangGraph orchestrator (CI runner)
+        env:
+          # Use PAT stored in repo secrets for full privileges, else fallback to default token
+          PAT_github: ${{ secrets.PAT_github || secrets.PAT_github }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4o-mini' }}
+          DEFAULT_BRANCH: ${{ secrets.DEFAULT_BRANCH || 'main' }}
+          AUTO_MERGE: ${{ secrets.AUTO_MERGE || 'false' }}
+        run: |
+          python Src/gh_action_runner.py \
+            --event_path "${{ github.event_path }}" \
+            --event_name "${{ github.event_name }}" \
+            --repo "${{ github.repository }}" \
+            --sha "${{ github.sha }}"
