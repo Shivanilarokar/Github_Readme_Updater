@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request, Header, HTTPException
 import hmac, hashlib, logging, os, sys, traceback, json
 from github import Github  # PyGithub
-import requests  # fallback direct REST API call
+import requests  # REST API fallback
 from Src.config import GITHUB_WEBHOOK_SECRET, GITHUB_TOKEN
 from Src.agents.orchestrator import run_flow
 
@@ -36,7 +36,7 @@ def verify_signature(body: bytes, signature: str):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
 def fetch_pr_files_via_rest(owner: str, repo: str, pr_number: int) -> list[dict]:
-    """Fetch PR file patches using REST API (fallback)"""
+    """Fetch PR file patches using REST API"""
     files, page, per_page = [], 1, 100
     while True:
         url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?page={page}&per_page={per_page}"
@@ -53,14 +53,23 @@ def fetch_pr_files_via_rest(owner: str, repo: str, pr_number: int) -> list[dict]
         page += 1
     return files
 
-def fetch_push_diffs_via_compare(owner: str, repo: str, before: str, after: str) -> list[dict]:
-    """Fetch push diffs between two SHAs using Compare API"""
-    url = f"https://api.github.com/repos/{owner}/{repo}/compare/{before}...{after}"
-    r = requests.get(url, headers=GH_HEADERS, timeout=20)
-    if r.status_code != 200:
+def fetch_push_diffs(owner: str, repo: str, before: str, after: str) -> list[dict]:
+    """Fetch push diffs via Compare API, fallback to commit if new branch"""
+    if before and not before.startswith("000000"):
+        # normal case: compare before..after
+        url = f"https://api.github.com/repos/{owner}/{repo}/compare/{before}...{after}"
+        r = requests.get(url, headers=GH_HEADERS, timeout=20)
+        if r.status_code == 200:
+            return r.json().get("files", [])
         logger.warning("REST compare fetch failed %s: %s", r.status_code, r.text)
-        return []
-    return r.json().get("files", [])
+
+    # fallback: single commit fetch
+    url = f"https://api.github.com/repos/{owner}/{repo}/commits/{after}"
+    r = requests.get(url, headers=GH_HEADERS, timeout=20)
+    if r.status_code == 200:
+        return r.json().get("files", [])
+    logger.warning("REST commit fetch failed %s: %s", r.status_code, r.text)
+    return []
 
 def truncate_patch(patch: str, max_lines: int = 20) -> str:
     """Truncate patch per file to avoid massive logs"""
@@ -112,12 +121,10 @@ async def webhook(
                 repo = payload["repository"]["name"]
                 pr_number = pr["number"]
 
-                # REST fallback (more reliable for patches)
                 rest_files = fetch_pr_files_via_rest(owner, repo, pr_number)
                 diffs = build_diffs_from_rest_filelist(rest_files)
 
-                logger.info("📌 Handling PR %s/%s#%s (files=%d)",
-                            owner, repo, pr_number, len(diffs))
+                logger.info("📌 Handling PR %s/%s#%s (files=%d)", owner, repo, pr_number, len(diffs))
                 for fn, patch in diffs.items():
                     logger.info(" - %s (patch? %s)", fn, "yes" if patch else "no")
                 logger.info("📌 Incoming diffs:\n%s", json.dumps(diffs, indent=2))
@@ -131,12 +138,10 @@ async def webhook(
             before = payload.get("before")
             after = payload.get("after")
 
-            # Compare API is best for push diffs
-            rest_files = fetch_push_diffs_via_compare(owner, repo, before, after)
+            rest_files = fetch_push_diffs(owner, repo, before, after)
             diffs = build_diffs_from_rest_filelist(rest_files)
 
-            logger.info("📌 Handling PUSH %s/%s @ %s (files=%d)",
-                        owner, repo, after, len(diffs))
+            logger.info("📌 Handling PUSH %s/%s @ %s (files=%d)", owner, repo, after, len(diffs))
             for fn, patch in diffs.items():
                 logger.info(" - %s (patch? %s)", fn, "yes" if patch else "no")
             logger.info("📌 Incoming diffs:\n%s", json.dumps(diffs, indent=2))
